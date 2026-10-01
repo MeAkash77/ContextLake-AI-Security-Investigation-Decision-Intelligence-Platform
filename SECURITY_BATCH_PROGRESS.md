@@ -1,0 +1,293 @@
+# Security batch progress
+
+Thirteen defects found by reading the code at `v14.0.0` (commit `079fdb6`). None
+had been exercised against a running deployment, so every item starts with a
+reproduction that fails on the untouched tree for the stated reason.
+
+Two of the thirteen are also items in
+[`plans/aisoc_parity_plan.plan.md`](plans/aisoc_parity_plan.plan.md). They are
+done once, here, and the parity tracker points at this file rather than
+repeating the work.
+
+## D0. This batch is public, by the maintainer's decision
+
+The source brief specified coordinated disclosure: a local branch pushed
+nowhere, a tracker under `.private/`, and advisory drafts handed over in chat
+for the maintainer to publish before any code became visible.
+
+The maintainer chose the opposite: ordinary public pull requests, merged and
+released as they land, with advisories filed afterwards against the release.
+The reasoning is that this is a self-hosted product whose defaults are readable
+by anyone who opens `.env.example`, so the fix reaching self-hosters sooner is
+worth more than the delay buying secrecy that the repository does not really
+have.
+
+What that changes, and what it does not:
+
+- No `.private/` directory. This file is the tracker and it is committed.
+- Commit messages stay neutral and carry no exploit detail, payloads or
+  advisory wording. That costs nothing, keeps the history readable, and leaves
+  the option of filing advisories against these commits later.
+- Advisory drafts are still produced for every defect: reproduction, root
+  cause, affected versions, a suggested CVSS v3.1 vector, and whether the fix
+  is breaking.
+- S1 and S13 both break callers, so this batch lands as a major.
+
+## Pre-existing state, captured before any code was written
+
+Measured on `origin/main` at `079fdb69` with the working tree stashed, so the
+numbers describe the untouched tree.
+
+### Gates: 77 of 84 pass
+
+The seven that do not, and why none is a defect in the tree:
+
+| Gate | Exit | Reason |
+|---|---|---|
+| `check_attribution.py` | 2 | Refuses to scan without `--all`, `--diff-base`, `--commits` or `--text-file`. |
+| `check_container_egress.py` | 2 | Refuses without `--service`: "a probe that covers nothing must not report clean". |
+| `check_published_secrets.py` | 2 | Refuses without `--check-env`, `--check` or `--list-guarded`. |
+| `check_codeql_alerts.py` | 2 | Needs `GITHUB_TOKEN` with `security-events: read`. Refuses rather than reporting clean about alerts it never read. |
+| `check_main_run_cancellations.py` | 2 | Needs a token for the Actions API, same refusal. |
+| `check_required_check_substance.py` | 2 | Needs a token for the Actions API, same refusal. |
+| `check_mypy_baseline.py` | 1 | Environmental, see D14. |
+
+Six of the seven are the gate contract working: they decline to render a
+verdict about a corpus they could not read. Only `check_mypy_baseline` reports
+a finding, and it does not reproduce in CI.
+
+### Console suite
+
+`apps/web`: 79 files, 816 tests, zero failures. `npx tsc --noEmit` clean.
+`npx eslint .` reports 0 errors and 76 warnings, all pre-existing.
+
+## Deviations: where the brief and the tree disagree
+
+### D1. S1c is 61 call sites, not 27
+
+The brief names `RBACView.tsx` and "any other header-less call you find".
+Counting by hand with a grep for `fetch('/api/v1` gives 27. The gate written
+for the item finds **61** across 21 files, and the extra 34 are not noise:
+
+- template-literal URLs behind a base variable, which the grep pattern cannot
+  see: `fetch(\`${API}/api/v1/honeytokens/${id}\`)` on the honeytokens and
+  purple-team pages (9 calls);
+- six calls inside `apps/web/src/lib/api.ts` itself, five of which sent
+  `X-Tenant-Id` and no token, which reads like an identity and is not one;
+- sixteen `useSWR` sites whose fetcher is a single-argument function and
+  therefore anonymous by construction.
+
+### D2. `require_permission_db` has 27 call sites, not 31
+
+All 27 are in-body `await <principal>.require_permission_db(...)`; there are
+**zero** as a `Depends`. They live in four modules only: `autonomy_policy.py`
+(9), `tenant_skills.py` (9), `business_context.py` (5), `mcp_servers.py` (4).
+The static figure in the brief is exact: 272, being 256 `Depends` plus 16
+direct calls.
+
+### D3. S3's "no authorization decision" is narrower than written
+
+All four routes in `services/api/app/api/v1/endpoints/shifts.py` do take
+`current_user: AuthUser`, so they authenticate. What is absent is any
+`require_permission(...)` and any tenant scoping, so the finding is
+cross-tenant read and write of one shared in-process list by any authenticated
+principal. The effect stands; the mechanism in the brief does not.
+
+### D4. S7's audit-read restriction is not a wildcard check
+
+`services/api/app/api/v1/endpoints/audit.py` contains no `"*"` comparison.
+Both read routes use `Depends(require_permission("audit_log:read"))`. The
+outcome the brief describes holds and is stronger than stated: `audit_log:read`
+appears in **no** role's permission list in `ROLE_PERMISSIONS`, so only the two
+roles holding `["*"]` can read the log. A `tenant_admin` gets 403 because the
+permission is unreachable, not because a wildcard was demanded.
+
+### D5. The production compose file already exists and nothing selects it
+
+S1's fix is not "write a production compose". `docker-compose.prod.yml` sets
+`ENVIRONMENT: production` and `AISOC_DEV_MODE: 0` as literals on all six Python
+services. But `Makefile:102` (`up:`) and `Makefile:142` (`up-full:`) never pass
+`-f docker-compose.prod.yml`, and `install.sh` and `install.ps1` contain zero
+occurrences of either variable. The file is correct and unreachable from every
+documented path.
+
+### D6. `realtime`'s push routes are worse than written
+
+The brief says the tenant comes "from a header or query parameter with no
+credential". `services/realtime/src/push.ts:92` reads `x-tenant-id`, falls back
+to the `tenant_id` query parameter, and then falls back to the literal string
+`'default'`. The three `POST /v1/push/*` routes carry only a rate limiter.
+
+### D7. Ten services default `AISOC_DEV_MODE=1`, and `api` is not one of them
+
+`docker-compose.yml` sets `AISOC_DEV_MODE: ${AISOC_DEV_MODE:-1}` on fusion,
+agents, osquery-tls, actions, connectors, threatintel, ueba, honeytokens,
+purple-team and slack-bot. The API service has no `AISOC_DEV_MODE` at all; it
+reaches the same bypass through `ENVIRONMENT: ${ENVIRONMENT:-development}` and
+`AUTH_BYPASS_ENVIRONMENTS`.
+
+### D14. `check_mypy_baseline` fails locally and passes in CI
+
+Locally it reports `(unmanaged)/scripts/run_evals.py: 15 index finding(s),
+baseline records 13`. CI is green at the same commit (28 success, 2 skipped on
+`079fdb69`), and the local mypy is 2.3.1, which is what `ci.yml:234` pins.
+
+The gate deliberately removes two sources of variance with
+`--no-site-packages --no-incremental`, documented at `ci.yml:272`. It does not
+pin the interpreter, and this machine runs Python 3.12.6 against CI's 3.11.
+Recorded as environmental rather than fixed, and worth noting as a gap in a
+gate whose whole purpose is reproducibility.
+
+## S1. Anonymous admin in the documented deployment
+
+Reproduced and confirmed live on `origin/main`. The crux is byte-identical, not
+merely similar: `dev_auth.py:29` `DEMO_TENANT_ID` and `bootstrap_admin.py:59`
+`DEFAULT_TENANT_ID` are both `00000000-0000-0000-0000-000000000001`, so the
+anonymous principal is an `admin` in the same tenant the real operator is
+bootstrapped into.
+
+- [x] **S1c** Console credential on every call ([#1069](https://github.com/beenuar/AiSOC/pull/1069))
+- [x] **S1a** The bypass needs an explicit opt-in, refuses a reachable bind address, and the demo
+      identity has its own tenant ([#1070](https://github.com/beenuar/AiSOC/pull/1072))
+- [x] **S1b** The nine vendored shims, the three `require_service_auth` copies, slack-bot and
+      realtime push ([#1070](https://github.com/beenuar/AiSOC/pull/1072))
+- [x] **S1d** Production-class defaults on every documented path ([#1073](https://github.com/beenuar/AiSOC/pull/1074))
+
+## S2 to S13
+
+- [ ] **S2** Copilot conversations and saved hunt searches are tenant-scoped
+- [ ] **S3** Fabricated shared shift state
+- [ ] **S4** STIX and TAXII demo data served outside demo mode
+- [ ] **S5** Login throttling and lockout
+- [ ] **S6** SSO stub identities deleted
+- [ ] **S7** Audit blind spots
+- [ ] **S8** Tenant isolation beyond query predicates
+- [ ] **S9** State-changing routes with no authorization decision
+- [ ] **S10** Attacker-controlled alert text can close and then silence alerts
+- [ ] **S11** Plaintext service traffic
+- [ ] **S12** Default Caldera API key
+- [ ] **S13** A custom role cannot restrict a user below their built-in role
+
+## Maintainer actions
+
+- [ ] Check whether the managed instance runs with a dev-class `ENVIRONMENT`
+      or serves more than one real tenant. If it does, assess exposure for S1
+      to S4 and rotate anything those routes could reach. (Named neutrally on
+      purpose: `scripts/check_hosted_hostname.py` keeps the managed hostname
+      out of this repository, and a tracker is not a reason to exempt it.)
+- [ ] Reserve the PyPI and npm names the packages will use (`aisoc` on PyPI
+      belongs to an unrelated project).
+- [ ] File the advisories against the release once the batch has landed.
+
+### D9. Flipping the default to production stops the API booting, until two more secrets exist
+
+Found by starting the stack, not by a test. `enforce_secure_defaults` refuses
+to boot when `METRICS_TOKEN` or `JWT_SECRET` is empty and the environment is
+not development-class, and `ensure_env.py` generated neither, because in a
+development-class environment that check only warns. So the posture change on
+its own would have turned "anonymous administrator" into "the API will not
+start". Both are generated now, taking `make env` from twelve secrets to
+fourteen.
+
+Two adjacent defects surfaced in the same hour, both of the same shape as one
+this repository has hit before — a value in `.env` that cannot reach the
+container that needs it:
+
+* neither secret was declared on the `api` service in `docker-compose.yml`, so
+  generating them was not sufficient;
+* `ingest-worker` hardcoded `JWT_SECRET: dev_secret_key_change_in_production`
+  as a bare literal. That value is in `INSECURE_SECRET_KEY_DEFAULTS`, so
+  anyone who read this repository held the key the service verified with, and
+  no `.env` value could displace it.
+
+### D10. The first live verification graded a cached image
+
+The probe stack came up from `ghcr.io/beenuar/aisoc-core-api:latest`, which
+was already on the machine, so the first three posture results described the
+pre-fix API rather than this branch. They looked plausible: production refused
+and development admitted, which is true of both trees. The tell was the third
+case, where a published bind address failed to refuse — a control that does
+not exist in the old code. Rebuild before probing, and prefer a probe that has
+a case the old code cannot pass.
+
+### D8. Two documents publish the claim-matrix row count in prose
+
+`ROADMAP.md` and `apps/docs/docs/compliance/evidence-pack.md` both state the
+figure, and `scripts/check_readme_figures.py` compares them against the live
+table. So every PR that adds a claim row moves three files, not one. The gate
+caught it on the first attempt here, which is what it is for.
+
+## Notes for the next session
+
+The batch order is dependency-driven, not severity-driven. S1c had to land
+before S1 because closing the anonymous path turns 61 console calls into 401s,
+and the console had to be able to authenticate first.
+
+S1 split into S1a/S1b (the code that decides whether to admit an
+uncredentialed caller, across all eleven services at once so the vendored
+copies and their cross-references move together) and S1d (the deployment
+paths). They are separable because S1a/S1b close the hole and S1d makes the
+documented experience match; shipping the first without the second leaves a
+correct default and a stale guide, which is the safe order.
+
+Two things found while fixing S1b that neither brief raised:
+
+* the API's push proxy stamped `X-AiSOC-Internal-Token` while realtime's
+  `requireInternal` reads `x-internal-token`, so the token it sent was never
+  checked by anything;
+* `userOf` in `services/realtime/src/push.ts` preferred a caller-supplied body
+  field over the stamped `X-User-Id`, under a comment asserting that the API
+  gateway validates it. It does not.
+
+## Status at the end of this session
+
+Eleven pull requests merged to `main`, which is green: **95 checks passing, 0
+failures** at `805ae445`. Claim-to-gate matrix at **253 rows, all GATED**.
+
+| Defect | PR | State |
+|---|---|---|
+| S1a/S1b anonymous bypass + demo tenant split | [#1072](https://github.com/beenuar/AiSOC/pull/1072) | merged |
+| S1c console credentials on all 61 calls | [#1069](https://github.com/beenuar/AiSOC/pull/1069) | merged |
+| S1d production posture on documented paths | [#1074](https://github.com/beenuar/AiSOC/pull/1074) | merged |
+| S2 copilot + saved hunts tenant-scoped | [#1079](https://github.com/beenuar/AiSOC/pull/1079) | merged |
+| S3/S4 fabricated shift + STIX data | [#1077](https://github.com/beenuar/AiSOC/pull/1077) | merged |
+| S5 login throttling and lockout | [#1075](https://github.com/beenuar/AiSOC/pull/1075) | merged |
+| S6 SSO stub identities deleted | [#1076](https://github.com/beenuar/AiSOC/pull/1076) | merged |
+| S7 audit attribution + tenant-admin reads | [#1080](https://github.com/beenuar/AiSOC/pull/1080) | merged |
+| S9 route authorization decisions | [#1081](https://github.com/beenuar/AiSOC/pull/1081) | merged |
+| S10 human-confirmed priors only | [#1082](https://github.com/beenuar/AiSOC/pull/1082) | merged |
+| S11/S12 TLS everywhere + Caldera default | [#1078](https://github.com/beenuar/AiSOC/pull/1078) | merged |
+| S8 RLS on `mssp_*`, plain-session ratchet | — | **not started** |
+| S13 database-backed RBAC at 272 static sites | — | **not started** |
+
+Ten of the thirteen are closed. **S8 and S13 remain**, and `v15.0.0` has not
+been cut — cutting it now would publish a security release that does not
+contain two of the defects it would claim to fix.
+
+### Where to resume
+
+1. **S8.** Four `mssp_*` tables carry no RLS policy; 51 modules open a plain
+   session rather than a tenant-scoped one; 35 predicate exceptions are
+   recorded. The pattern to copy is migration `076` from S2, which pairs a
+   `tenant_id NOT NULL` column, forced RLS, and an explicit `aisoc_app` grant
+   — the grant matters because `ALTER DEFAULT PRIVILEGES` only covers tables
+   created by the role that ran it.
+2. **S13.** 272 static permission checks resolve against `ROLE_PERMISSIONS`
+   rather than the RBAC tables. Note that S9 added `knowledge_base:read` to
+   five roles there, so the migration has one more permission to carry than
+   the plan describes.
+3. **`v15.0.0`**, once both land, with the advisory drafts this file records.
+
+### Two things a resumed session should not relearn
+
+**The matrix parser stops at a blank line inside the table.** Several rebases
+put a new row *after* `## Summary`, where it parsed as nothing and silently
+lowered the published GATED count. `/tmp/aisoc-tools/rebase-onto-main.sh`
+handles the three files that conflict on every one of these PRs and
+recomputes the summary from the parser rather than merging it textually.
+
+**A new gate must satisfy `check_gate_contract.py`.** It copies `scripts/`
+into a repository containing nothing else and requires every check to refuse.
+`sync_vendored_kafka_security.py` resolved its root from `__file__` and
+reported four matching copies over a tree with no services at all; use
+`gate_toolkit.repo_root()`, which asks git, and declare a `--self-test`.
